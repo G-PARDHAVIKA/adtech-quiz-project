@@ -1,10 +1,34 @@
 import express from "express";
 import cors from "cors";
 import fs from "fs/promises";
+import sqlite3 from "sqlite3";
+import { open } from "sqlite";
+import { Configuration, OpenAIApi } from "openai";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// --- Leaderboard DB setup (SQLite) ---
+let db;
+(async () => {
+  db = await open({ filename: new URL('./leaderboard.db', import.meta.url).pathname, driver: sqlite3.Database });
+  await db.exec(`CREATE TABLE IF NOT EXISTS scores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    score INTEGER,
+    total INTEGER,
+    level TEXT,
+    date INTEGER
+  )`);
+})();
+
+// --- OpenAI setup (optional, uses OPENAI_API_KEY env var) ---
+let openai = null;
+if (process.env.OPENAI_API_KEY) {
+  const conf = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
+  openai = new OpenAIApi(conf);
+}
 
 // Read simple knowledge base from book.txt and parse short facts into subjects and definitions
 async function loadFacts() {
@@ -133,6 +157,47 @@ function generateFromFacts(facts, count = 20, level = "medium") {
 
 let cachedFacts = null;
 
+async function refineQuestions(questions, level = 'medium') {
+  if (!openai) return questions;
+  const refined = [];
+  for (const q of questions) {
+    try {
+      const system = 'You are a helpful quiz editor. Return only valid JSON.';
+      const prompt = `Refine and improve this multiple-choice question for a ${level} level learner. Input JSON: ${JSON.stringify(q)}. Return a JSON object with keys: question (string), options (array of 4 unique strings), answer (one of the options), explanation (short). Output only JSON.`;
+      const resp = await openai.createChatCompletion({
+        model: 'gpt-3.5-turbo',
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: prompt }
+        ],
+        max_tokens: 400
+      });
+      const text = resp.data.choices[0].message.content.trim();
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch (e) {
+        // Try to extract JSON substring
+        const match = text.match(/\{[\s\S]*\}/);
+        if (match) parsed = JSON.parse(match[0]);
+      }
+      if (parsed && parsed.question && parsed.options && parsed.answer) {
+        // ensure options length 4
+        const options = Array.isArray(parsed.options) ? parsed.options.slice(0, 4) : q.options;
+        // ensure answer in options
+        if (!options.includes(parsed.answer)) options[0] = parsed.answer;
+        refined.push({ ...q, question: parsed.question, options, answer: parsed.answer, explanation: parsed.explanation || '' });
+      } else {
+        refined.push(q);
+      }
+    } catch (err) {
+      console.error('refine failed for q', q.id, err && err.message);
+      refined.push(q);
+    }
+  }
+  return refined;
+}
+
 app.get("/api/questions", async (req, res) => {
   try {
     // Support level: easy, medium, hard. Default is medium.
@@ -141,8 +206,15 @@ app.get("/api/questions", async (req, res) => {
     // Allow large counts but protect server: cap to 2000 by default
     const count = isNaN(rawCount) ? 100 : Math.max(1, Math.min(2000, rawCount));
 
+    const refine = String(req.query.refine || "false").toLowerCase() === 'true';
+
     if (!cachedFacts) cachedFacts = await loadFacts();
-    const questions = generateFromFacts(cachedFacts, count, level);
+    let questions = generateFromFacts(cachedFacts, count, level);
+
+    if (refine && openai) {
+      questions = await refineQuestions(questions, level);
+    }
+
     res.json({ count: questions.length, questions, level });
   } catch (err) {
     console.error(err);
@@ -155,6 +227,38 @@ app.get("/api/question", async (req, res) => {
   if (!cachedFacts) cachedFacts = await loadFacts();
   const q = generateFromFacts(cachedFacts, 1)[0];
   res.json(q);
+});
+
+// Leaderboard endpoints
+app.post('/api/score', async (req, res) => {
+  try {
+    const { name, score, total, level } = req.body || {};
+    if (!name || typeof score !== 'number' || typeof total !== 'number') {
+      return res.status(400).json({ error: 'Invalid payload. Provide name, score (number), total (number).' });
+    }
+    await db.run('INSERT INTO scores (name, score, total, level, date) VALUES (?, ?, ?, ?, ?)', [name, score, total, level || 'unknown', Date.now()]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save score' });
+  }
+});
+
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    const level = req.query.level || 'all';
+    const limit = Math.min(50, parseInt(req.query.limit || '10', 10));
+    let rows;
+    if (level === 'all') {
+      rows = await db.all('SELECT name, score, total, level, date FROM scores ORDER BY score DESC, date ASC LIMIT ?', [limit]);
+    } else {
+      rows = await db.all('SELECT name, score, total, level, date FROM scores WHERE level = ? ORDER BY score DESC, date ASC LIMIT ?', [level, limit]);
+    }
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch leaderboard' });
+  }
 });
 
 app.listen(5000, () => console.log("✅ Backend running at http://localhost:5000"));
