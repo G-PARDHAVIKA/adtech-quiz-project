@@ -1,0 +1,26 @@
+# Node
+node_modules/
+
+# Frontend build
+frontend/build/
+
+# Backend DB
+backend/leaderboard.db
+
+# Env
+.env
+
+# OS files
+.DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Misc
+coverage/
